@@ -49,6 +49,8 @@ library
     QuickCheck
   exposed-modules:
     Crypto.Fido2.Assertion,
+    -- TODO: Remove
+    Crypto.Fido2.Assertion.FFI,
     Crypto.Fido2.Attestation,
     -- TODO: Remove
     Crypto.Fido2.Credential.FFI,
