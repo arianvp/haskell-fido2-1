@@ -23,6 +23,9 @@ common sanity
     OverloadedStrings
     TypeApplications
     DuplicateRecordFields
+  pkgconfig-depends:
+    libcrypto,
+    libfido2,
 
 library
   import: sanity
@@ -47,6 +50,8 @@ library
   exposed-modules:
     Crypto.Fido2.Assertion,
     Crypto.Fido2.Attestation,
+    -- TODO: Remove
+    Crypto.Fido2.Credential.FFI,
     Crypto.Fido2.Protocol,
     Crypto.Fido2.PublicKey
 
