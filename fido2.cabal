@@ -53,7 +53,11 @@ library
     Crypto.Fido2.Assertion.FFI,
     Crypto.Fido2.Attestation,
     -- TODO: Remove
+    Crypto.Fido2.CBOR.FFI,
+    -- TODO: Remove
     Crypto.Fido2.Credential.FFI,
+    -- TODO: Remove
+    Crypto.Fido2.FFI,
     Crypto.Fido2.Protocol,
     Crypto.Fido2.PublicKey
 

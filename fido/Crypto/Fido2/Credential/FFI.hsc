@@ -3,11 +3,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 
 module Crypto.Fido2.Credential.FFI
-  ( FIDOOption,
-    omit,
-    false,
-    true,
-    c_fido_cred_new,
+  ( c_fido_cred_new,
     c_fido_cred_free,
     c_fido_cred_prot,
     c_fido_cred_fmt,
@@ -33,20 +29,10 @@ module Crypto.Fido2.Credential.FFI
   )
 where
 
+import Crypto.Fido2.FFI (FIDOOption(..))
 import Foreign (Ptr)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (CInt), CSize (CSize))
-
-#include <fido.h>
-
-#{enum FIDOOption, FIDOOption
- , omit = FIDO_OPT_OMIT
- , false = FIDO_OPT_FALSE
- , true = FIDO_OPT_TRUE
- }
-
-newtype FIDOOption = FIDOOption {unFIDOOption :: CInt}
-  deriving (Eq, Ord, Show, Read)
 
 data CredentialStruct
 
