@@ -6,8 +6,9 @@ module Crypto.Fido2.Attestation (verifyAttestationResponse) where
 import Control.Monad (unless, when)
 import Crypto.Fido2.Attestation.Error (Error (ChallengeDidNotMatch, InvalidWebauthnType, NoAttestedCredentialDataFound, OriginDidNotMatch, RpIdMismatch, UserNotPresent, UserNotVerified))
 import Crypto.Fido2.Attestation.Packed as Packed (verify)
+import Crypto.Fido2.Attestation.TPM as TPM (verify)
 import Crypto.Fido2.Protocol
-  ( AttestationFormat (FormatNone, FormatPacked),
+  ( AttestationFormat (FormatNone, FormatPacked, FormatTPM),
     AttestationObject (AttestationObject, authData, format),
     AttestedCredentialData,
     AuthenticatorAttestationResponse (AuthenticatorAttestationResponse, attestationObject, clientData),
@@ -175,3 +176,4 @@ validateAttStmt FormatNone AuthenticatorData {attestedCredentialData} _ =
     Just attestedCredentialData -> pure attestedCredentialData
     Nothing -> Left NoAttestedCredentialDataFound
 validateAttStmt (FormatPacked stmt) authData clientDataHash = Packed.verify stmt authData clientDataHash
+validateAttStmt (FormatTPM stmt) authData clientDataHash = TPM.verify stmt authData clientDataHash

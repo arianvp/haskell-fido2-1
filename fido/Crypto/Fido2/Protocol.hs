@@ -49,6 +49,7 @@ import Codec.CBOR.Term (Term (TBytes, TMap, TString))
 import qualified Codec.Serialise.Class as Serialise
 import qualified Crypto.Fido2.Attestation.Error as AttestationError
 import qualified Crypto.Fido2.Attestation.Packed.Statement as Packed
+import qualified Crypto.Fido2.Attestation.TPM.Statement as TPM
 import Crypto.Fido2.PublicKey (COSEAlgorithmIdentifier, PublicKey)
 import qualified Crypto.Fido2.PublicKey as PublicKey
 import Crypto.Hash (Digest, SHA256)
@@ -492,7 +493,7 @@ data AttestationObjectRaw = AttestationObjectRaw
 
 -- | Represents both the format and the parsed attestation statement. This is different from the protocol that
 --  implies storing the format and statement seperately.
-data AttestationFormat = FormatNone | FormatPacked Packed.Stmt
+data AttestationFormat = FormatNone | FormatPacked Packed.Stmt | FormatTPM TPM.Stmt
   deriving (Show)
 
 data AttestationObject = AttestationObject
