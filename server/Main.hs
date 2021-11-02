@@ -11,7 +11,6 @@ import Control.Concurrent.STM (TVar)
 import qualified Control.Concurrent.STM as STM
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.Maybe (MaybeT (MaybeT, runMaybeT))
 import qualified Crypto.Fido2.Model as M
 import qualified Crypto.Fido2.Model.JavaScript as JS
 import Crypto.Fido2.Model.JavaScript.Decoding (decodeCreatedPublicKeyCredential, decodeRequestedPublicKeyCredential)
@@ -23,8 +22,6 @@ import Crypto.Fido2.PublicKey (COSEAlgorithmIdentifier (COSEAlgorithmIdentifierE
 import Crypto.Hash (hash)
 import Data.Aeson (FromJSON)
 import qualified Data.ByteString.Base64.URL as Base64
-import qualified Data.ByteString.Builder as Builder
-import qualified Data.ByteString.Lazy as LBS
 import Data.List (find)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Map (Map)
@@ -34,104 +31,20 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.IO as Text
 import qualified Data.Text.Lazy as LText
-import qualified Data.Text.Lazy.Encoding as LText
-import Data.UUID (UUID)
-import qualified Data.UUID as UUID
-import qualified Data.UUID.V4 as UUID
 import Data.Validation (Validation (Failure, Success))
 import qualified Database
 import GHC.Generics (Generic)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai.Middleware.Static (addBase, staticPolicy)
+import Session (IsSession (initialSession), SessionId, casSession, getSessionScotty)
 import System.Environment (getArgs)
 import System.Random.Stateful (globalStdGen, uniformM)
-import qualified Web.Cookie as Cookie
 import Web.Scotty (ScottyM)
 import qualified Web.Scotty as Scotty
 
--- Generate a new session for the current user and expose it as a @SetCookie@.
-newSession :: TVar Sessions -> IO (SessionId, Session, Cookie.SetCookie)
-newSession sessions = do
-  sessionId <- UUID.nextRandom
-  let session = Unauthenticated
-  STM.atomically $ do
-    contents <- STM.readTVar sessions
-    STM.writeTVar sessions $ Map.insert sessionId session contents
-  pure
-    ( sessionId,
-      session,
-      Cookie.defaultSetCookie
-        { Cookie.setCookieName = "session",
-          Cookie.setCookieValue = UUID.toASCIIBytes sessionId,
-          Cookie.setCookieSameSite = Just Cookie.sameSiteStrict,
-          Cookie.setCookieHttpOnly = True,
-          Cookie.setCookiePath = Just "/"
-          -- Does not work on localhost: the browser doesn't send any cookies
-          -- to a non-TLS version of localhost.
-          -- TODO: Use mkcert to get a HTTPS setup for localhost.
-          -- , Cookie.setCookieSecure = True
-        }
-    )
-
-newSessionScotty :: TVar Sessions -> Scotty.ActionM (SessionId, Session)
-newSessionScotty sessions = do
-  (sessionId, session, setCookie) <- liftIO $ newSession sessions
-  -- Scotty is great. Internally, it contains [(HeaderName, ByteString)]
-  -- for the headers. The API does not expose this, so here we convert from
-  -- bytestring to text and then internally in scotty to bytestring again..
-  -- This is quite the unfortunate conversion because the Builder type can
-  -- only output lazy bytestrings. Fun times.
-  Scotty.setHeader
-    "Set-Cookie"
-    (LText.decodeUtf8 (Builder.toLazyByteString (Cookie.renderSetCookie setCookie)))
-  pure (sessionId, session)
-
-getSession :: TVar Sessions -> SessionId -> MaybeT Scotty.ActionM (SessionId, Session)
-getSession sessions sessionId = do
-  contents <- liftIO $ STM.atomically $ STM.readTVar sessions
-  session <- MaybeT . pure $ Map.lookup sessionId contents
-  pure (sessionId, session)
-
-readSessionId :: MaybeT Scotty.ActionM UUID
-readSessionId = do
-  cookieHeader <- MaybeT $ Scotty.header "cookie"
-  let cookies = Cookie.parseCookies $ LBS.toStrict $ LText.encodeUtf8 cookieHeader
-  sessionCookie <- MaybeT . pure $ lookup "session" cookies
-  MaybeT . pure $ UUID.fromASCIIBytes sessionCookie
-
--- Check if the user has a session cookie.
---
--- If the user doens't have a session set, create a new one and register it
--- with our session registry.
---
--- If the user already has a session set, we don't do anything.
-getSessionScotty :: TVar Sessions -> Scotty.ActionM (SessionId, Session)
-getSessionScotty sessions = do
-  result <- runMaybeT $ do
-    uuid <- readSessionId
-    getSession sessions uuid
-  maybe (newSessionScotty sessions) pure result
-
--- | @casVersion@ searches for the session with the given @SessionId@ and will compare
--- and swap it, replacing the @old@ session with the @new@ session. Returns @Nothing@
--- if the CAS was unsuccessful.
-casSession :: TVar Sessions -> SessionId -> Session -> Session -> STM.STM ()
-casSession sessions sessionId old new = do
-  contents <- STM.readTVar sessions
-  case Map.updateLookupWithKey casSession sessionId contents of
-    (Just _, newMap) -> do
-      STM.writeTVar sessions newMap
-      pure ()
-    (Nothing, _map) -> pure ()
-  where
-    casSession :: SessionId -> Session -> Maybe Session
-    casSession _sessionId current
-      | current == old = Just new
-      | otherwise = Nothing
-
 -- Session data that we store for each user.
 --
---                         +---> Registering ----+
+--                         +----> Registering ---+
 --                         |                     |
 --      Unauthenticated ---+                     +---> Authenticated
 --                         |                     |
@@ -147,6 +60,11 @@ data Session
   | Authenticated M.UserHandle
   deriving (Eq, Show)
 
+instance IsSession Session where
+  initialSession = Unauthenticated
+
+type Sessions = Map SessionId Session
+
 isUnauthenticated :: Session -> Bool
 isUnauthenticated session = case session of
   Unauthenticated -> True
@@ -156,10 +74,6 @@ isAuthenticated :: Session -> Bool
 isAuthenticated session = case session of
   Authenticated _ -> True
   _ -> False
-
-type Sessions = Map SessionId Session
-
-type SessionId = UUID
 
 data RegisterBeginReq = RegisterBeginReq
   { userName :: Text,
@@ -303,9 +217,12 @@ completeRegistration origin rpIdHash db sessions = do
       let userHandle = M.pkcueId $ M.pkcocUser options
       credential <- Scotty.jsonData @JS.CreatedPublicKeyCredential
       cred <- case decodeCreatedPublicKeyCredential allSupportedFormats credential of
-        Left err -> fail $ show err
-        Right result -> pure result
-      liftIO $ putStrLn $ "/register/complete, received " <> show cred
+        Left err -> do
+          liftIO $ putStrLn $ "/register/complete, failure " <> show err
+          fail $ show err
+        Right result -> do
+          liftIO $ putStrLn $ "/register/complete, received " <> show result
+          pure result
       -- step 1 to 17
       -- We abort if we couldn't attest the credential
       -- FIXME
