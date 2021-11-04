@@ -11,7 +11,7 @@ import qualified Codec.CBOR.Term as CBOR
 import Control.Exception (Exception)
 import Control.Monad (forM)
 import qualified Crypto.Fido2.Model as M
-import Crypto.Fido2.PublicKey (toPublicKey)
+import Crypto.Fido2.PublicKey (certPublicKey)
 import Crypto.Hash (Digest, SHA256)
 import qualified Data.ASN1.Parse as ASN1
 import Data.Bifunctor (first)
@@ -64,7 +64,7 @@ instance M.AttestationStatementFormat Format where
 
       let cert = X509.getCertificate credCert
 
-      pubKey <- case toPublicKey undefined (X509.certPubKey cert) of
+      pubKey <- case certPublicKey cert of
         Nothing -> Left $ DecodingErrorPublicKey (X509.certPubKey cert)
         Just key -> pure key
       undefined
