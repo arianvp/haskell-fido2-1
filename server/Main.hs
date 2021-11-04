@@ -36,7 +36,7 @@ import qualified Database
 import GHC.Generics (Generic)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai.Middleware.Static (addBase, staticPolicy)
-import Session (IsSession (initialSession), SessionId, casSession, getSessionScotty)
+import Session (SessionsVar, withSession)
 import System.Environment (getArgs)
 import System.Random.Stateful (globalStdGen, uniformM)
 import Web.Scotty (ScottyM)
@@ -54,26 +54,13 @@ import qualified Web.Scotty as Scotty
 --  choice. Should be safe to do? But let's double check that the spec
 --  actually guarantees that you own the public key after registering.
 data Session
-  = Unauthenticated
-  | Registering (M.PublicKeyCredentialOptions 'M.Create)
+  = Registering (M.PublicKeyCredentialOptions 'M.Create)
   | Authenticating M.UserHandle (M.PublicKeyCredentialOptions 'M.Get)
-  | Authenticated M.UserHandle
   deriving (Eq, Show)
 
-instance IsSession Session where
-  initialSession = Unauthenticated
+-- Send signed options to the script, which then passes it on to the next
 
-type Sessions = Map SessionId Session
-
-isUnauthenticated :: Session -> Bool
-isUnauthenticated session = case session of
-  Unauthenticated -> True
-  _ -> False
-
-isAuthenticated :: Session -> Bool
-isAuthenticated session = case session of
-  Authenticated _ -> True
-  _ -> False
+type Sessions = SessionsVar Session
 
 data RegisterBeginReq = RegisterBeginReq
   { userName :: Text,
@@ -82,17 +69,21 @@ data RegisterBeginReq = RegisterBeginReq
   deriving (Show, FromJSON)
   deriving stock (Generic)
 
-app :: M.Origin -> M.RpIdHash -> Database.Connection -> TVar Sessions -> ScottyM ()
+app :: M.Origin -> M.RpIdHash -> Database.Connection -> Sessions -> ScottyM ()
 app origin rpIdHash db sessions = do
   Scotty.middleware (staticPolicy (addBase "dist"))
   Scotty.post "/register/begin" $ beginRegistration db sessions
   Scotty.post "/register/complete" $ completeRegistration origin rpIdHash db sessions
   Scotty.post "/login/begin" $ beginLogin db sessions
   Scotty.post "/login/complete" $ completeLogin origin rpIdHash db sessions
-  Scotty.get "/requires-auth" $ do
-    (_sessionId, session) <- getSessionScotty sessions
-    unless (isAuthenticated session) (Scotty.raiseStatus HTTP.status401 "Please authenticate first")
+  Scotty.get "/requires-auth" $ authRequired sessions
+
+authRequired :: Sessions -> Scotty.ActionM ()
+authRequired sessions = withSession sessions $ \session -> case session of
+  Just (Authenticated _) -> do
     Scotty.json @Text $ "This should only be visible when authenticated"
+    return session
+  _ -> Scotty.raiseStatus HTTP.status401 "Please authenticate first"
 
 mkCredentialDescriptor :: CredentialEntry -> M.PublicKeyCredentialDescriptor
 mkCredentialDescriptor CredentialEntry {ceCredentialId} =
@@ -112,42 +103,39 @@ handleError :: Show e => Either e a -> Scotty.ActionM a
 handleError (Left x) = Scotty.raiseStatus HTTP.status400 . LText.fromStrict . Text.pack . show $ x
 handleError (Right x) = pure x
 
-beginLogin :: Database.Connection -> TVar Sessions -> Scotty.ActionM ()
-beginLogin db sessions = do
-  (sessionId, session) <- getSessionScotty sessions
-  userId' <- Scotty.jsonData @Text
-  userId <- case Base64.decodeUnpadded (Text.encodeUtf8 userId') of
-    Left err -> fail $ "Failed to base64url decode the user id " <> show userId' <> ": " <> err
-    Right res -> pure $ M.UserHandle res
-  credentials <- liftIO $
-    Database.withTransaction db $ \tx -> do
-      Database.getCredentialsByUserId tx userId
-  when (null credentials) $ Scotty.raiseStatus HTTP.status404 "User not found"
-  unless
-    (isUnauthenticated session)
-    (Scotty.raiseStatus HTTP.status400 "You need to be unauthenticated to begin login")
-  challenge <- liftIO $ uniformM globalStdGen
-  let options =
-        M.PublicKeyCredentialRequestOptions
-          { M.pkcogRpId = Nothing,
-            M.pkcogTimeout = Nothing,
-            M.pkcogChallenge = challenge,
-            M.pkcogAllowCredentials = Just (map mkCredentialDescriptor credentials),
-            M.pkcogUserVerification = Nothing,
-            M.pkcogExtensions = Nothing
-          }
-  liftIO $ STM.atomically $ casSession sessions sessionId session (Authenticating userId options)
-  Scotty.json $ encodePublicKeyCredentialRequestOptions options
+beginLogin :: Database.Connection -> Sessions -> Scotty.ActionM ()
+beginLogin db sessions = withSession sessions $ \case
+  Just _ -> Scotty.raiseStatus HTTP.status400 "You need to be unauthenticated to begin login"
+  Nothing -> do
+    userId' <- Scotty.jsonData @Text
+    userId <- case Base64.decodeUnpadded (Text.encodeUtf8 userId') of
+      Left err -> fail $ "Failed to base64url decode the user id " <> show userId' <> ": " <> err
+      Right res -> pure $ M.UserHandle res
+    credentials <- liftIO $
+      Database.withTransaction db $ \tx -> do
+        Database.getCredentialsByUserId tx userId
+    when (null credentials) $ Scotty.raiseStatus HTTP.status404 "User not found"
+    challenge <- liftIO $ uniformM globalStdGen
+    let options =
+          M.PublicKeyCredentialRequestOptions
+            { M.pkcogRpId = Nothing,
+              M.pkcogTimeout = Nothing,
+              M.pkcogChallenge = challenge,
+              M.pkcogAllowCredentials = Just (map mkCredentialDescriptor credentials),
+              M.pkcogUserVerification = Nothing,
+              M.pkcogExtensions = Nothing
+            }
 
-completeLogin :: M.Origin -> M.RpIdHash -> Database.Connection -> TVar Sessions -> Scotty.ActionM ()
-completeLogin origin rpIdHash db sessions = do
-  (sessionId, session) <- getSessionScotty sessions
-  case session of
-    Authenticating userHandle options -> verifyLogin sessionId session userHandle options
-    _ -> Scotty.raiseStatus HTTP.status400 "You need to be authenticating to complete login"
+    Scotty.json $ encodePublicKeyCredentialRequestOptions options
+    pure $ Just (Authenticating userId options)
+
+completeLogin :: M.Origin -> M.RpIdHash -> Database.Connection -> Sessions -> Scotty.ActionM ()
+completeLogin origin rpIdHash db sessions = withSession sessions $ \case
+  Just (Authenticating userHandle options) -> verifyLogin userHandle options
+  _ -> Scotty.raiseStatus HTTP.status400 "You need to be authenticating to complete login"
   where
-    verifyLogin :: SessionId -> Session -> M.UserHandle -> M.PublicKeyCredentialOptions 'M.Get -> Scotty.ActionM ()
-    verifyLogin sessionId session userHandle options = do
+    verifyLogin :: M.UserHandle -> M.PublicKeyCredentialOptions 'M.Get -> Scotty.ActionM (Maybe Session)
+    verifyLogin userHandle options = do
       credential <- Scotty.jsonData @JS.RequestedPublicKeyCredential
 
       cred <- case decodeRequestedPublicKeyCredential credential of
@@ -168,21 +156,19 @@ completeLogin origin rpIdHash db sessions = do
         Failure (err :| _) -> fail $ show err
         Success result -> pure result
       -- FIXME: Set new signature count
-      liftIO $
-        STM.atomically $
-          casSession sessions sessionId session (Authenticated userHandle)
+      --liftIO $
+      --  casSession sessions sessionId session (Authenticated userHandle)
       Scotty.json @Text "Welcome."
+      pure $ Just $ Authenticated userHandle
 
-beginRegistration :: Database.Connection -> TVar Sessions -> Scotty.ActionM ()
-beginRegistration db sessions = do
-  (sessionId, session) <- getSessionScotty sessions
-  -- NOTE: We currently do not support multiple credentials per user.
-  case session of
-    Unauthenticated -> generateRegistrationChallenge sessionId session
-    _ -> Scotty.raiseStatus HTTP.status400 "You need to be unauthenticated to begin registration"
+-- NOTE: We currently do not support multiple credentials per user.
+beginRegistration :: Database.Connection -> Sessions -> Scotty.ActionM ()
+beginRegistration db sessions = withSession sessions $ \case
+  Nothing -> generateRegistrationChallenge session
+  _ -> Scotty.raiseStatus HTTP.status400 "You need to be unauthenticated to begin registration"
   where
-    generateRegistrationChallenge :: SessionId -> Session -> Scotty.ActionM ()
-    generateRegistrationChallenge sessionId session = do
+    generateRegistrationChallenge :: Scotty.ActionM ()
+    generateRegistrationChallenge = do
       req@RegisterBeginReq {userName, displayName} <- Scotty.jsonData @RegisterBeginReq
       liftIO $ putStrLn $ "/register/begin, received " <> show req
       challenge <- liftIO $ uniformM globalStdGen
@@ -199,21 +185,15 @@ beginRegistration db sessions = do
       liftIO $
         Database.withTransaction db $ \tx -> do
           Database.addUser tx user
-          STM.atomically $ casSession sessions sessionId session (Registering options)
+          casSession sessions sessionId session (Registering options)
 
-completeRegistration :: M.Origin -> M.RpIdHash -> Database.Connection -> TVar Sessions -> Scotty.ActionM ()
-completeRegistration origin rpIdHash db sessions = do
-  (sessionId, session) <- getSessionScotty sessions
-  case session of
-    Registering options ->
-      verifyRegistration sessionId options
-    _ ->
-      Scotty.raiseStatus
-        HTTP.status400
-        "You need to be registering to complete registration"
+completeRegistration :: M.Origin -> M.RpIdHash -> Database.Connection -> Sessions -> Scotty.ActionM ()
+completeRegistration origin rpIdHash db sessions = withSession sessions $ \case
+  Just (Registering options) -> verifyRegistration options
+  _ -> Scotty.raiseStatus HTTP.status400 "You need to be registering to complete registration"
   where
-    verifyRegistration :: SessionId -> M.PublicKeyCredentialOptions 'M.Create -> Scotty.ActionM ()
-    verifyRegistration sessionId options = do
+    verifyRegistration :: M.PublicKeyCredentialOptions 'M.Create -> Scotty.ActionM (Maybe Session)
+    verifyRegistration options = do
       let userHandle = M.pkcueId $ M.pkcocUser options
       credential <- Scotty.jsonData @JS.CreatedPublicKeyCredential
       cred <- case decodeCreatedPublicKeyCredential allSupportedFormats credential of
@@ -277,7 +257,7 @@ main = do
   [Text.pack -> origin, Text.pack -> domain, read -> port] <- getArgs
   db <- Database.connect
   Database.initialize db
-  sessions <- STM.newTVarIO Map.empty
+  sessions <- emptySessions
   Text.putStrLn $ "You can view the web-app at: " <> origin <> "/index.html"
   let rpIdHash = M.RpIdHash $ hash $ Text.encodeUtf8 domain
   Scotty.scotty port $ app (M.Origin origin) rpIdHash db sessions
