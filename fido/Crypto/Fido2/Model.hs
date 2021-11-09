@@ -430,7 +430,7 @@ newtype CredentialId = CredentialId {unCredentialId :: BS.ByteString}
 -- created credential’s attestation object. See the [§ 13.4.3 Cryptographic Challenges](https://www.w3.org/TR/webauthn-2/#sctn-cryptographic-challenges)
 -- security consideration.
 newtype Challenge = Challenge {unChallenge :: BS.ByteString}
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 -- | [(spec)](https://www.w3.org/TR/webauthn-2/#sctn-cryptographic-challenges)
 -- In order to prevent replay attacks, the challenges MUST contain enough entropy
