@@ -7,8 +7,6 @@ module Main
   )
 where
 
-import Control.Concurrent.STM (TVar)
-import qualified Control.Concurrent.STM as STM
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (MaybeT, runMaybeT))
@@ -27,8 +25,6 @@ import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as LBS
 import Data.List (find)
 import Data.List.NonEmpty (NonEmpty ((:|)))
-import Data.Map (Map)
-import qualified Data.Map as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -40,18 +36,12 @@ import qualified Database
 import GHC.Generics (Generic)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai.Middleware.Static (addBase, staticPolicy)
+import PendingOps (PendingOps, getPendingLogin, getPendingRegistering, insertPendingLogin, insertPendingRegistering, withPendingOps)
 import System.Environment (getArgs)
 import System.Random.Stateful (globalStdGen, uniformM)
 import qualified Web.Cookie as Cookie
 import Web.Scotty (ScottyM)
 import qualified Web.Scotty as Scotty
-
-data PendingOp
-  = Registering (M.PublicKeyCredentialOptions 'M.Create)
-  | Authenticating M.UserHandle (M.PublicKeyCredentialOptions 'M.Get)
-  deriving (Eq, Show)
-
-type PendingOps = TVar (Map M.Challenge PendingOp)
 
 data RegisterBeginReq = RegisterBeginReq
   { userName :: Text,
@@ -130,17 +120,17 @@ beginLogin db pending = do
     Database.withTransaction db $ \tx -> do
       Database.getCredentialsByUserId tx userId
   when (null credentials) $ Scotty.raiseStatus HTTP.status404 "User not found"
-  challenge <- liftIO $ uniformM globalStdGen
-  let options =
-        M.PublicKeyCredentialRequestOptions
-          { M.pkcogRpId = Nothing,
-            M.pkcogTimeout = Nothing,
-            M.pkcogChallenge = challenge,
-            M.pkcogAllowCredentials = map mkCredentialDescriptor credentials,
-            M.pkcogUserVerification = M.UserVerificationRequirementPreferred,
-            M.pkcogExtensions = Nothing
-          }
-  liftIO $ STM.atomically $ STM.modifyTVar pending $ Map.insert challenge $ Authenticating userId options
+  options <- liftIO $
+    insertPendingLogin pending userId $ \challenge -> do
+      M.PublicKeyCredentialRequestOptions
+        { M.pkcogRpId = Nothing,
+          M.pkcogTimeout = Nothing,
+          M.pkcogChallenge = challenge,
+          M.pkcogAllowCredentials = map mkCredentialDescriptor credentials,
+          M.pkcogUserVerification = M.UserVerificationRequirementPreferred,
+          M.pkcogExtensions = Nothing
+        }
+
   Scotty.json $ encodePublicKeyCredentialRequestOptions options
 
 completeLogin :: M.Origin -> M.RpIdHash -> Database.Connection -> PendingOps -> Scotty.ActionM ()
@@ -151,19 +141,10 @@ completeLogin origin rpIdHash db pending = do
     Left err -> fail $ show err
     Right result -> pure result
 
-  let challenge = M.ccdChallenge $ M.argClientData $ M.pkcResponse cred
-
-  mpendingOp <- liftIO $
-    STM.atomically $ do
-      contents <- STM.readTVar pending
-      let result = Map.lookup challenge contents
-      STM.writeTVar pending $ Map.delete challenge contents
-      pure result
-
-  (userHandle, options) <- case mpendingOp of
-    Nothing -> Scotty.raiseStatus HTTP.status401 "Challenge not known"
-    (Just (Registering _)) -> Scotty.raiseStatus HTTP.status401 "Wrong operation"
-    (Just (Authenticating userHandle options)) -> return (userHandle, options)
+  (userHandle, options) <-
+    liftIO (getPendingLogin pending cred) >>= \case
+      Nothing -> Scotty.raiseStatus HTTP.status401 "Mismatched pending operation"
+      Just result -> pure result
 
   -- TODO: Query for the credential id directly
   entries <- liftIO $
@@ -186,7 +167,6 @@ beginRegistration :: Database.Connection -> PendingOps -> Scotty.ActionM ()
 beginRegistration db pending = do
   req@RegisterBeginReq {userName, displayName} <- Scotty.jsonData @RegisterBeginReq
   liftIO $ putStrLn $ "/register/begin, received " <> show req
-  challenge <- liftIO $ uniformM globalStdGen
   userId <- liftIO $ uniformM globalStdGen
   let user =
         M.PublicKeyCredentialUserEntity
@@ -194,13 +174,12 @@ beginRegistration db pending = do
             M.pkcueDisplayName = M.UserAccountDisplayName displayName,
             M.pkcueName = M.UserAccountName userName
           }
-  let options = defaultPkcco user challenge
+  options <- liftIO $ insertPendingRegistering pending $ defaultPkcco user
   liftIO $ putStrLn $ "/register/begin, sending " <> show options
-  Scotty.json $ encodePublicKeyCredentialCreationOptions options
-  liftIO $ STM.atomically $ STM.modifyTVar pending $ Map.insert challenge $ Registering options
   liftIO $
     Database.withTransaction db $ \tx -> do
       Database.addUser tx user
+  Scotty.json $ encodePublicKeyCredentialCreationOptions options
 
 completeRegistration :: M.Origin -> M.RpIdHash -> Database.Connection -> PendingOps -> Scotty.ActionM ()
 completeRegistration origin rpIdHash db pending = do
@@ -210,19 +189,10 @@ completeRegistration origin rpIdHash db pending = do
     Right result -> pure result
   liftIO $ putStrLn $ "/register/complete, received " <> show cred
 
-  let challenge = M.ccdChallenge $ M.arcClientData $ M.pkcResponse cred
-
-  mpendingOp <- liftIO $
-    STM.atomically $ do
-      contents <- STM.readTVar pending
-      let result = Map.lookup challenge contents
-      STM.writeTVar pending $ Map.delete challenge contents
-      pure result
-
-  options <- case mpendingOp of
-    Nothing -> Scotty.raiseStatus HTTP.status401 "Challenge not known"
-    (Just (Registering options)) -> return options
-    (Just (Authenticating _ _)) -> Scotty.raiseStatus HTTP.status401 "Wrong operation"
+  options <-
+    liftIO (getPendingRegistering pending cred) >>= \case
+      Nothing -> Scotty.raiseStatus HTTP.status401 "Invalid pending operation"
+      Just result -> pure result
 
   let userHandle = M.pkcueId $ M.pkcocUser options
   -- step 1 to 17
@@ -279,7 +249,7 @@ main = do
   [Text.pack -> origin, Text.pack -> domain, read -> port] <- getArgs
   db <- Database.connect
   Database.initialize db
-  pending <- STM.newTVarIO Map.empty
-  Text.putStrLn $ "You can view the web-app at: " <> origin <> "/index.html"
-  let rpIdHash = M.RpIdHash $ hash $ Text.encodeUtf8 domain
-  Scotty.scotty port $ app (M.Origin origin) rpIdHash db pending
+  withPendingOps $ \pending -> do
+    Text.putStrLn $ "You can view the web-app at: " <> origin <> "/index.html"
+    let rpIdHash = M.RpIdHash $ hash $ Text.encodeUtf8 domain
+    Scotty.scotty port $ app (M.Origin origin) rpIdHash db pending
